@@ -1,13 +1,26 @@
 {-# LANGUAGE RecordWildCards #-}
 {-|
- - A Breakout clone. The paddle follows the mouse cursor.
- -}
+A Breakout clone. The paddle follows the mouse cursor.
+
+Try adding your own features, including, but not limited to:
+ * More levels
+ * Score multipliers and combos
+ * Paddle friction and/or ball spin
+ * Animations and effects
+ * Multiple balls (collision code already included)
+ * Powerups!
+
+Known issues:
+ * Collision handling is very ad-hoc and gives strange results,
+   especially with corners.
+ * Window is not resizable.
+-}
 
 module Main where
 
 import qualified Data.List as L
 import qualified Data.Map as M
-import           Data.Maybe (fromMaybe, listToMaybe, catMaybes)
+import           Data.Maybe (maybe, fromMaybe, listToMaybe, catMaybes)
 import           Debug.Trace (traceShow)
 import           Text.Printf (printf)
 
@@ -29,6 +42,7 @@ import qualified Helm.Sub as Sub
 import qualified Helm.Time as Time
 import           Helm.Time (Time, inSeconds, second)
 
+
 import qualified Paths_helm as Paths
 
 type Score = Integer
@@ -39,7 +53,7 @@ data Action
   | Simulate Double             -- ^ Physics step.
   | PaddleTarget (V2 Double)    -- ^ Change where the paddle moves towards.
   | ChangePhase                 -- ^ Pause, resume, move to next level, etc.
-  | NextLevel                   -- ^ Internal action that advances to the next level.
+                                --   depending on context.
   deriving (Eq)
 
 -- | Represents the active playing field.
@@ -70,11 +84,31 @@ data GameState = GameState
   , gamePhase    :: !Phase
   }
 
+-- | Properties of a brick.
+data Brick = Brick
+  { brickColor       :: !Color
+  , brickValue       :: !Score
+  , brickTopLeft     :: !(V2 Double)
+  , brickBottomRight :: !(V2 Double)
+  }
+
+-- | Properties of a ball.
+data Ball = Ball
+  -- | Position of the center.
+  { ballPos :: !(V2 Double)
+  , ballVel :: !(V2 Double)
+  }
+  deriving (Eq, Show)
+
+ballRadius :: Double
+ballRadius = 0.5
+
 paddleSize = V2 4 1
 
 gridSize :: V2 Int
 gridSize = V2 48 32
 
+-- Initial and default states.
 initBall :: Ball
 initBall = Ball {ballPos = V2 12 20, ballVel = V2 10 10}
 
@@ -101,13 +135,18 @@ isGameOver state = null (activeBalls (activeField state)) && livesLeft state < 1
 
 -- | Game update function.
 update :: GameState -> Action -> (GameState, Cmd SDLEngine Action)
+-- Pause/resume or move forward in the game.
 update state@GameState { .. } ChangePhase
+  -- Pause.
   | gamePhase == Running && not (isGameOver state) =
     (state { gamePhase = Paused }, Cmd.none)
-  | gamePhase == Running && isGameOver state =
-    (initGame, Cmd.none)
+  -- Resume.
   | gamePhase == Paused =
     (state { gamePhase = Running }, Cmd.none)
+  -- Restart from game over.
+  | gamePhase == Running && isGameOver state =
+    (initGame, Cmd.none)
+  -- Launch a new ball.
   | gamePhase == BeforeNewBall =
     ( state
       { gamePhase = Running
@@ -116,6 +155,7 @@ update state@GameState { .. } ChangePhase
       },
       Cmd.none
     )
+  -- Advance to the next level.
   | gamePhase == AfterLevel =
     case futureLevels of
       [] -> (state, Cmd.none)
@@ -128,12 +168,15 @@ update state@GameState { .. } ChangePhase
           }
         , Cmd.none
         )
+  -- Start the current level.
   | gamePhase == BeforeNewLevel =
       (state { gamePhase = Running }, Cmd.none)
 
+-- Adjust where the paddle moves towards.
 update state@GameState { .. } (PaddleTarget target)
   = (state { paddleTarget = Just (target / pure pixelsPerGrid) }, Cmd.none)
 
+-- Advance the game state by a small amount.
 update state@GameState { .. } (Simulate dt)
   | gamePhase == Running && not (isGameOver state) =
       ( state
@@ -144,15 +187,21 @@ update state@GameState { .. } (Simulate dt)
       , Cmd.none
       )
   where
+        -- Update the playing field and score.
         (field', score') =
           environmentCollisions
-            (filter (not . ballDropped) $ activeBalls activeField) []
+            (ballCollisions $
+             filter (not . ballDropped) $
+             activeBalls activeField)
+            []
             (activeBricks activeField)
             currentScore
 
+        -- Change phase if appropriate.
         phase' | null (activeBricks field') = AfterLevel
                | null (activeBalls field')  =
-                 if livesLeft > 0 then BeforeNewBall else Running -- game over
+                 -- Enter a game over state
+                 if livesLeft > 0 then BeforeNewBall else Running
                | otherwise                  = Running
 
         -- We collide each ball with all other objects in sequence.
@@ -160,6 +209,12 @@ update state@GameState { .. } (Simulate dt)
         -- the ball simply bounces off both walls.
         stepBalls = map (\ball@Ball { .. } ->
                            ball { ballPos = ballPos + ballVel * pure (inSeconds dt) })
+
+        -- Ball collisions with each other.
+        ballCollisions allBalls =
+          [ L.foldl' (\b b2 -> maybe b fst (collideBallBall b b2)) b
+                     (filter (/= b) allBalls)
+          | b <- allBalls ]
 
         -- Ball collisions with bricks, paddle and walls.
         environmentCollisions [] movedBalls bricks score =
@@ -176,6 +231,7 @@ update state@GameState { .. } (Simulate dt)
               (ball4, bricks', score') = collideBricks ball3 bricks [] score
           in environmentCollisions balls (ball4:movedBalls) bricks' score'
 
+        -- Handle collision for one ball, removing bricks it collides with.
         collideBricks ball [] doneBricks score = (ball, doneBricks, score)
         collideBricks ball (brick@Brick { .. } : bricks) doneBricks score =
           case collideBallRect ball (brickTopLeft, brickBottomRight) of
@@ -192,38 +248,19 @@ update state@GameState { .. } (Simulate dt)
 
 update state _ = (state, Cmd.none)
 
--- | Properties of a brick.
-data Brick = Brick
-  { brickColor       :: !Color
-  , brickValue       :: !Score
-  , brickTopLeft     :: !(V2 Double)
-  , brickBottomRight :: !(V2 Double)
-  }
-
--- | Properties of a ball.
-data Ball = Ball
-  -- | Position of the center.
-  { ballPos :: !(V2 Double)
-  , ballVel :: !(V2 Double)
-  }
-  deriving Show
-
-ballRadius :: Double
-ballRadius = 0.5
-
 -- Collision checks.
 
 -- | Collide two balls. Returns the updated balls if they collided.
 collideBallBall :: Ball -> Ball -> Maybe (Ball, Ball)
 collideBallBall
-  ballA@Ball{ ballPos = posA@(V2 xA yA), ballVel = velA }
-  ballB@Ball{ ballPos = posB@(V2 xB yB), ballVel = velB }
+  ballA@Ball{ ballPos = posA, ballVel = velA }
+  ballB@Ball{ ballPos = posB, ballVel = velB }
   | quadrance (posA - posB) > ballRadius^2 = Nothing
   | otherwise =
       -- Reflect the balls off their mutual tangent plane.
       -- Unrealistic, but simple and generally looks OK.
-      Just ( ballA { ballVel = reflectAway (posB - posA) velA }
-           , ballB { ballVel = reflectAway (posA - posB) velB }
+      Just ( ballA { ballVel = reflectAway (posA - posB) velA }
+           , ballB { ballVel = reflectAway (posB - posA) velB }
            )
 
 -- | Collide a ball with a rectangle, given by its top-left and bottom-right corners.
@@ -258,11 +295,12 @@ collideBallRect ball@Ball{ ballPos = ballPos@(V2 x y), ballVel = ballVel }
 collideBallField :: Ball -> Maybe Ball
 collideBallField ball =
   listToMaybe . catMaybes $ map (collideBallRect ball)
-    [ (V2 (-100) (-100), V2 (gridWidth+100) 0)
-    , (V2 (-100) (-100), V2 0 (gridHeight+100))
-    , (V2 gridWidth (-100), V2 gridWidth (gridHeight+100))
+    [ (V2 (-margin) (-margin), V2 (gridWidth+margin) 0)
+    , (V2 (-margin) (-margin), V2 0 (gridHeight+margin))
+    , (V2 gridWidth (-margin), V2 gridWidth (gridHeight+margin))
     ]
   where V2 gridWidth gridHeight = fmap fromIntegral gridSize
+        margin = 100
 
 -- | Check whether a ball has fallen out of the playing field.
 ballDropped :: Ball -> Bool
@@ -285,6 +323,7 @@ reflectAway normal ray
   where unitNorm = signorm normal
         project  = dot ray unitNorm
 
+-- | Default brick types.
 brick1, brick2, brick3, brick4 :: Brick
 brick1 = Brick
   { brickColor = rgb 0.0 0.0 0.8
@@ -335,7 +374,8 @@ level1 =
         brickColumns = [brickWidth, brickWidth*2 .. gridWidth - brickWidth*2]
         V2 gridWidth gridHeight = fmap fromIntegral gridSize
 
--- | Level 2 is a circular ring.
+-- | Level 2 is a circular ring of square bricks.
+-- Score: 5000+
 level2 :: [Brick]
 level2 = concat
   [
@@ -360,15 +400,15 @@ level2 = concat
         V2 gridWidth gridHeight = fmap fromIntegral gridSize
         center = V2 (gridWidth / 2) 10
 
+-- | Input mapping.
 subscriptions :: Sub SDLEngine Action
 subscriptions = Sub.batch
   [ Mouse.clicks $ \_ _ -> ChangePhase
   , Mouse.moves $ PaddleTarget . fmap fromIntegral
-  , Keyboard.presses $ \key -> (case key of
-      _ -> DoNothing)
-  , Time.fps 300 Simulate
+  , Time.fps 60 Simulate
   ]
 
+-- Rendering functions.
 viewBrick :: Brick -> Form SDLEngine
 viewBrick Brick { .. } = move (brickTopLeft + brickDims / 2) $ group $
   [ filled brickColor box
@@ -391,6 +431,7 @@ viewField Field { .. } = group $
   map viewBall activeBalls ++
   [ viewPaddle paddlePos ]
 
+-- | Top-level rendering function.
 view :: GameState -> Graphics SDLEngine
 view state@GameState { .. } =
   Graphics2D $ collage $
@@ -409,15 +450,6 @@ view state@GameState { .. } =
             Text.toText $ printf "Level %d   Score: %d   Lives: %d"
                                  currentLevel currentScore livesLeft
           ]
-
-        pausedOverlay
-          | gamePhase /= Paused = blank
-          | otherwise = group $
-            [ move (fieldRect / 2) $ filled (rgba 0.5 0.5 0.5 0.3) $ rect fieldRect
-            , toForm $ center (fieldRect / 2) $ collage $
-              [ text $ Text.color (rgb 0.3 0.3 0.3) $ Text.height 4 $
-                Text.toText "PAUSED" ]
-            ]
 
         phaseTextHeight = 30
         phaseText color msg = toForm $ center (windowRect / 2) $ collage $
