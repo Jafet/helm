@@ -403,8 +403,9 @@ view state@GameState { .. } =
 
         statsHeight = 16
         statsOverlay = group $
-          [ move (V2 (windowWidth/2) (windowHeight - statsHeight - 10)) $
-            text $ Text.color (rgb 1.0 1.0 1.0) $ Text.height statsHeight $
+          [ move (V2 10 (windowHeight - statsHeight - 10)) $
+            text $
+            Text.alignBottomLeft $ Text.color (rgb 1.0 1.0 1.0) $ Text.height statsHeight $
             Text.toText $ printf "Level %d   Score: %d   Lives: %d"
                                  currentLevel currentScore livesLeft
           ]
