@@ -38,8 +38,9 @@ data Action
   = DoNothing                   -- ^ Do nothing.
   | Simulate Double             -- ^ Physics step.
   | PaddleTarget (V2 Double)    -- ^ Change where the paddle moves towards.
-  | Pause                       -- ^ Pause or resume the game.
+  | ChangePhase                 -- ^ Pause, resume, move to next level, etc.
   | NextLevel                   -- ^ Internal action that advances to the next level.
+  deriving (Eq)
 
 -- | Represents the active playing field.
 -- Note that all Field coordinates are relative to the game's gridSize.
@@ -49,6 +50,15 @@ data Field = Field
   , paddlePos    :: !(V2 Double) -- ^ Centered position
   }
 
+-- | Phases of the game.
+data Phase
+  = Running
+  | Paused
+  | BeforeNewBall
+  | AfterLevel
+  | BeforeNewLevel
+  deriving (Eq)
+
 -- | Represents the game state of the game.
 data GameState = GameState
   { activeField  :: Field
@@ -57,7 +67,7 @@ data GameState = GameState
   , livesLeft    :: !Int
   , currentLevel :: !Int
   , futureLevels :: [[Brick]]
-  , isRunning    :: !Bool
+  , gamePhase    :: !Phase
   }
 
 paddleSize = V2 4 1
@@ -82,8 +92,8 @@ initGame = GameState
   , currentScore = 0
   , livesLeft    = 3
   , currentLevel = 1
-  , futureLevels = []
-  , isRunning    = False
+  , futureLevels = [level1]
+  , gamePhase    = BeforeNewLevel
   }
 
 isGameOver :: GameState -> Bool
@@ -91,18 +101,45 @@ isGameOver state = null (activeBalls (activeField state)) && livesLeft state < 1
 
 -- | Game update function.
 update :: GameState -> Action -> (GameState, Cmd SDLEngine Action)
-update state@GameState { .. } Pause
-  | not (isGameOver state) = (state { isRunning = not isRunning }, Cmd.none)
+update state@GameState { .. } ChangePhase
+  | gamePhase == Running && not (isGameOver state) =
+    (state { gamePhase = Paused }, Cmd.none)
+  | gamePhase == Running && isGameOver state =
+    (initGame, Cmd.none)
+  | gamePhase == Paused =
+    (state { gamePhase = Running }, Cmd.none)
+  | gamePhase == BeforeNewBall =
+    ( state
+      { gamePhase = Running
+      , activeField = activeField { activeBalls = [initBall] }
+      , livesLeft = livesLeft - 1
+      },
+      Cmd.none
+    )
+  | gamePhase == AfterLevel =
+    case futureLevels of
+      [] -> (state, Cmd.none)
+      (level:futureLevels') ->
+        ( state
+          { gamePhase    = Running
+          , activeField  = initField level
+          , currentLevel = currentLevel + 1
+          , futureLevels = futureLevels'
+          }
+        , Cmd.none
+        )
+  | gamePhase == BeforeNewLevel =
+      (state { gamePhase = Running }, Cmd.none)
 
 update state@GameState { .. } (PaddleTarget target)
   = (state { paddleTarget = Just (target / pure pixelsPerGrid) }, Cmd.none)
 
 update state@GameState { .. } (Simulate dt)
-  | not (isGameOver state) && isRunning =
+  | gamePhase == Running && not (isGameOver state) =
       ( state
-        { activeField  = field''
+        { activeField  = field'
         , currentScore = score'
-        , livesLeft    = livesLeft'
+        , gamePhase    = phase'
         }
       , Cmd.none
       )
@@ -113,12 +150,10 @@ update state@GameState { .. } (Simulate dt)
             (activeBricks activeField)
             currentScore
 
-        (livesLeft', field'')
-          | null (activeBalls field') && livesLeft > 0 =
-              ( livesLeft - 1
-              , field' { activeBalls = [initBall] }
-              )
-          | otherwise = (livesLeft, field')
+        phase' | null (activeBricks field') = AfterLevel
+               | null (activeBalls field')  =
+                 if livesLeft > 0 then BeforeNewBall else Running -- game over
+               | otherwise                  = Running
 
         -- We collide each ball with all other objects in sequence.
         -- This takes care of balls hitting corner interiors:
@@ -300,9 +335,34 @@ level1 =
         brickColumns = [brickWidth, brickWidth*2 .. gridWidth - brickWidth*2]
         V2 gridWidth gridHeight = fmap fromIntegral gridSize
 
+-- | Level 2 is a circular ring.
+level2 :: [Brick]
+level2 = concat
+  [
+    [ placeBrick (center + V2 x y) brick4
+    | x <- [-10..10], y <- [-10..10], between (4^2) (5^2) (quadrance (V2 x y))
+    ]
+  , [ placeBrick (center + V2 x y) brick3
+    | x <- [-10..10], y <- [-10..10], between (5^2) (6^2) (quadrance (V2 x y))
+    ]
+  , [ placeBrick (center + V2 x y) brick2
+    | x <- [-10..10], y <- [-10..10], between (6^2) (7^2) (quadrance (V2 x y))
+    ]
+  , [ placeBrick (center + V2 x y) brick1
+    | x <- [-10..10], y <- [-10..10], between (7^2) (8^2) (quadrance (V2 x y))
+    ]
+  ]
+  where placeBrick pos brick@Brick{..} =
+          brick { brickTopLeft = pos
+                , brickBottomRight = pos + 1
+                }
+        between low high x = low <= x && x < high
+        V2 gridWidth gridHeight = fmap fromIntegral gridSize
+        center = V2 (gridWidth / 2) 10
+
 subscriptions :: Sub SDLEngine Action
 subscriptions = Sub.batch
-  [ Mouse.clicks $ \_ _ -> Pause
+  [ Mouse.clicks $ \_ _ -> ChangePhase
   , Mouse.moves $ PaddleTarget . fmap fromIntegral
   , Keyboard.presses $ \key -> (case key of
       _ -> DoNothing)
@@ -334,24 +394,23 @@ viewField Field { .. } = group $
 view :: GameState -> Graphics SDLEngine
 view state@GameState { .. } =
   Graphics2D $ collage $
-    [ statsOverlay ] ++
-    map (scale pixelsPerGrid)
-        [ viewField activeField
-        , pausedOverlay
-        , gameOverOverlay
-        ]
+    [ statsOverlay
+    , scale pixelsPerGrid $ viewField activeField
+    , phaseOverlay
+    ]
   where fieldRect@(V2 fieldWidth fieldHeight) = fmap fromIntegral gridSize
-        V2 windowWidth windowHeight = fmap fromIntegral windowDims
+        windowRect@(V2 windowWidth windowHeight) = fmap fromIntegral windowDims
 
         statsHeight = 16
         statsOverlay = group $
           [ move (V2 (windowWidth/2) (windowHeight - statsHeight - 10)) $
             text $ Text.color (rgb 1.0 1.0 1.0) $ Text.height statsHeight $
-            Text.toText $ printf "Score: %d   Lives: %d" currentScore livesLeft
+            Text.toText $ printf "Level %d   Score: %d   Lives: %d"
+                                 currentLevel currentScore livesLeft
           ]
 
         pausedOverlay
-          | isRunning = blank
+          | gamePhase /= Paused = blank
           | otherwise = group $
             [ move (fieldRect / 2) $ filled (rgba 0.5 0.5 0.5 0.3) $ rect fieldRect
             , toForm $ center (fieldRect / 2) $ collage $
@@ -359,14 +418,26 @@ view state@GameState { .. } =
                 Text.toText "PAUSED" ]
             ]
 
-        gameOverOverlay
-          | not (isGameOver state) = blank
-          | otherwise = group $
-            [ move (fieldRect / 2) $ filled (rgba 0.5 0.5 0.5 0.3) $ rect fieldRect
-            , toForm $ center (fieldRect / 2) $ collage $
-              [ text $ Text.color (rgb 1.0 0.2 0.0) $ Text.height 4 $
-                Text.toText "GAME OVER" ]
-            ]
+        phaseTextHeight = 30
+        phaseText color msg = toForm $ center (windowRect / 2) $ collage $
+                              [ text $ Text.color color $ Text.height phaseTextHeight $
+                                Text.toText msg ]
+        phaseOverlay
+          | gamePhase == Running && isGameOver state = group $
+              [ move (windowRect / 2) $ filled (rgba 1.0 0.3 0.3 0.1) $ rect windowRect
+              , phaseText (rgb 1.0 0.0 0.0) "GAME OVER"
+              ]
+          | gamePhase == Paused = group $
+              [ move (windowRect / 2) $ filled (rgba 0.5 0.5 0.5 0.3) $ rect windowRect
+              , phaseText (rgb 0.7 0.7 0.7) "PAUSED"
+              ]
+          | gamePhase == AfterLevel =
+              if null futureLevels
+              then phaseText (brickColor brick4) "No more levels!"
+              else phaseText (brickColor brick4) "Click to continue"
+          | gamePhase == BeforeNewLevel = phaseText (rgb 0.7 0.7 0.7) "Click to start"
+          | gamePhase == BeforeNewBall  = phaseText (rgb 0.7 0.7 0.7) "Click to continue"
+          | otherwise = blank
 
 windowDims :: V2 Int
 windowDims = V2 768 512
