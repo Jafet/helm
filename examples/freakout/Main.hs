@@ -92,7 +92,7 @@ initGame = GameState
   , currentScore = 0
   , livesLeft    = 3
   , currentLevel = 1
-  , futureLevels = [level1]
+  , futureLevels = [level2]
   , gamePhase    = BeforeNewLevel
   }
 
@@ -121,7 +121,7 @@ update state@GameState { .. } ChangePhase
       [] -> (state, Cmd.none)
       (level:futureLevels') ->
         ( state
-          { gamePhase    = Running
+          { gamePhase    = BeforeNewLevel
           , activeField  = initField level
           , currentLevel = currentLevel + 1
           , futureLevels = futureLevels'
@@ -433,8 +433,8 @@ view state@GameState { .. } =
               ]
           | gamePhase == AfterLevel =
               if null futureLevels
-              then phaseText (brickColor brick4) "No more levels!"
-              else phaseText (brickColor brick4) "Click to continue"
+              then phaseText (brickColor brick4) "ALL LEVELS COMPLETE"
+              else phaseText (brickColor brick4) (printf "LEVEL %d COMPLETE" currentLevel)
           | gamePhase == BeforeNewLevel = phaseText (rgb 0.7 0.7 0.7) "Click to start"
           | gamePhase == BeforeNewBall  = phaseText (rgb 0.7 0.7 0.7) "Click to continue"
           | otherwise = blank
